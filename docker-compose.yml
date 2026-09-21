@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: invoice_db
+      POSTGRES_USER: invoice_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invoice-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoice_user -d invoice_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "5080:5080"
+    environment:
+      INVOICE_API_KEY: ${INVOICE_API_KEY:-invoice-demo-key-2026}
+      DATABASE_URL: postgresql://invoice_user:${POSTGRES_PASSWORD:-invoice-password}@db:5432/invoice_db
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:5080/health')"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
