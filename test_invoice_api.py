@@ -41,12 +41,12 @@ def test_negative_amount_is_rejected():
         }
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert response.json["status"] == "invalid"
 
 
 def test_duplicate_invoice_is_rejected(monkeypatch):
-    monkeypatch.setattr(invoice_api, "invoice_exists", lambda invoice_id: True)
+    monkeypatch.setattr(invoice_api, "save_invoice", lambda invoice: None)
 
     client = invoice_api.app.test_client()
 
@@ -66,7 +66,7 @@ def test_duplicate_invoice_is_rejected(monkeypatch):
         }
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 409
     assert response.json["duplicate"] is True
 
 
@@ -77,3 +77,16 @@ def test_health_endpoint():
 
     assert response.status_code == 200
     assert response.json["status"] == "ok"
+
+
+def test_invalid_dry_run_value_is_rejected():
+    client = invoice_api.app.test_client()
+
+    response = client.post(
+        "/reminder-runs",
+        headers={"X-API-Key": "invoice-demo-key-2026"},
+        json={"dry_run": "sometimes"},
+    )
+
+    assert response.status_code == 400
+    assert response.json["received"] is False
