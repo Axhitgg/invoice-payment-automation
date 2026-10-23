@@ -1,58 +1,78 @@
 # Invoice Payment Automation
 
-A rule-based invoice and reminder prototype using Python, Flask, PostgreSQL, n8n and Gmail. No LLM is required for the invoice logic.
+A rule-based invoice follow-up prototype using Python, Flask, PostgreSQL and n8n-compatible API steps. It tracks invoice state, safely claims reminder work, records delivery outcomes and suppresses queued reminders after payment. No LLM is required for the invoice logic.
 
 ## Business problem
 
-Teams tracking unpaid invoices manually can overlook due dates or send a reminder after payment has already been recorded. This project gives a scheduled workflow a structured list of unpaid invoices that need attention.
+Manual invoice follow-up has more risk than simply calculating a due date:
 
-## Example
+- two scheduled runs can select the same invoice;
+- a payment can arrive after a reminder is queued;
+- an email provider can fail and require a bounded retry;
+- a team needs a record of what was queued, sent, failed or skipped.
 
-A small agency submits an unpaid invoice. The API validates the amount and dates and stores it. On a daily schedule, n8n calls the reminder endpoint, splits the results and sends a customer reminder. An overdue record can also trigger a finance-team alert. Invoices recorded as paid are excluded from the reminder query.
+This prototype separates **previewing reminder candidates** from **claiming delivery work**. PostgreSQL is the source of truth for invoice and reminder state.
 
 ```text
-Invoice / n8n webhook -> Flask validation -> Duplicate-ID check -> PostgreSQL
-Scheduled n8n trigger -> GET /reminders -> Due-date routing -> Gmail
+Invoice intake -> validation -> atomic PostgreSQL insert
+Schedule -> dry-run preview -> claim once -> n8n/email provider
+                                      |-> sent outcome
+                                      |-> failed outcome -> bounded retry
+Payment update -----------------------> suppress queued reminder
 ```
 
-## Implemented rules
+## Implemented lifecycle
 
-| Invoice state | Recommended action |
+| Situation | Result |
 | --- | --- |
-| Paid | No reminder |
-| Unpaid, due in 0-3 days | Payment reminder |
-| Unpaid and overdue | Overdue reminder and finance alert |
-| Due later | No reminder yet |
+| Paid or cancelled invoice | Excluded from reminder selection |
+| Unpaid, due in 0-3 days | One `due_soon` reminder can be claimed |
+| Unpaid and overdue | One `overdue` reminder can be claimed |
+| Same schedule runs twice | Database uniqueness prevents a second claim for that stage |
+| Payment recorded while reminder is queued | Queued event is marked `skipped` |
+| Provider reports failure | Event records a short failure code and can be requeued |
+| Third failed attempt reached | Further retry is rejected |
 
-The API validates positive amounts and ISO dates, rejects due dates earlier than issue dates, normalises customer email and currency, checks invoice IDs and persists records. n8n/Gmail delivery is a separate configured workflow; an importable n8n export is not included in this repository.
+Reminder claims use invoice row locks plus a unique `(invoice_id, reminder_kind)` database constraint. This protects concurrent runs without pretending an email was sent. The workflow must report `sent` or `failed` after the provider responds.
 
 ## Run locally
 
-Create an untracked `.env` in the cloned repository:
+Create an untracked `.env`:
 
 ```dotenv
 INVOICE_API_KEY=replace-with-a-unique-local-secret
 POSTGRES_PASSWORD=replace-with-a-url-safe-local-password
 ```
 
-Then start the API and PostgreSQL with Docker Compose:
+Start a fresh API/database pair:
 
 ```sh
 docker compose up --build -d
 curl http://127.0.0.1:5080/health
+curl http://127.0.0.1:5080/ready
 ```
 
-Compose supplies DATABASE_URL. `init.sql` runs when creating a fresh database volume, not as a migration on every restart. Stop without removing data using `docker compose down`. Override demo defaults with your own secrets.
+`init.sql` is only applied when PostgreSQL creates a fresh volume. For an existing database created by the earlier project version, back it up and apply [`migrations/001_invoice_lifecycle.sql`](migrations/001_invoice_lifecycle.sql) once before using the new endpoints. Do not point the migration at a database you have not identified and backed up.
 
 ## API
 
+All endpoints except `/health` and `/ready` require `X-API-Key` matching `INVOICE_API_KEY`.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | /health | Process health |
-| POST | /invoice | Validate and save an invoice |
-| GET | /reminders | Return unpaid invoices due within three days or already overdue |
+| GET | `/health` | Process health |
+| GET | `/ready` | Database connectivity |
+| POST | `/invoice` | Validate and atomically save an invoice |
+| PATCH | `/invoices/{invoice_id}/status` | Mark unpaid, paid or cancelled; suppress queued work for terminal states |
+| GET | `/reminders` | Backward-compatible read-only preview |
+| POST | `/reminder-runs` | Preview candidates or claim delivery work |
+| PATCH | `/reminder-events/{reminder_id}` | Record a `sent` or `failed` delivery outcome |
+| POST | `/reminder-events/{reminder_id}/retry` | Requeue a failed delivery below the attempt limit |
+| GET | `/reminder-events/summary` | Count queued, sent, failed and skipped events |
 
-The invoice and reminder endpoints require `X-API-Key` matching INVOICE_API_KEY. Synthetic invoice body:
+### 1. Create a synthetic invoice
+
+Use dates relative to the day you run the example:
 
 ```json
 {
@@ -63,28 +83,87 @@ The invoice and reminder endpoints require `X-API-Key` matching INVOICE_API_KEY.
   "amount": 25000,
   "currency": "INR",
   "issue_date": "2026-10-18",
-  "due_date": "2026-10-21",
+  "due_date": "2026-10-24",
   "status": "unpaid"
 }
 ```
 
-Adjust sample dates relative to the day you run the demo. Reminder decisions use the server date. `/reminders` returns `reminder_count` and `reminders`; it does not itself send email or mark a reminder as sent. Missing/invalid fields and duplicate IDs currently return HTTP 200 with `received: false`, so inspect the body. Supply a stable invoice_id for repeat-submission detection.
+Successful creation returns HTTP `201`. Duplicate invoice IDs or invoice numbers return `409`; invalid amount/date/status input returns `400`.
+
+### 2. Preview without writing
+
+```http
+POST /reminder-runs
+X-API-Key: ...
+Content-Type: application/json
+
+{"dry_run": true}
+```
+
+The response lists candidates and always reports `queued_count: 0`. This is suitable for an operator preview or an n8n approval step.
+
+### 3. Claim reminder work
+
+Send `{"dry_run": false}` to the same endpoint. Newly claimed items include a `reminder_id` and `delivery_status: queued`. A repeated or concurrent run cannot claim the same invoice stage again.
+
+### 4. Record the provider result
+
+```json
+{"status": "sent"}
+```
+
+or, without customer/message text:
+
+```json
+{"status": "failed", "failure_code": "EMAIL_PROVIDER_TIMEOUT"}
+```
+
+A failed event can be returned to `queued` through its retry endpoint until the three-attempt limit is reached.
+
+### 5. Record payment
+
+```json
+{"status": "paid"}
+```
+
+The status endpoint marks the invoice paid and changes any still-queued event to `skipped` in the same transaction. Paid and cancelled invoices are terminal in this prototype and cannot be reopened.
 
 ## Tests
+
+Fast tests:
 
 ```sh
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt pytest
-INVOICE_API_KEY=invoice-demo-key-2026 python -m pytest -q test_invoice_api.py
+python -m pytest -q test_invoice_api.py
 ```
 
-The four tests cover missing API key, negative amount, duplicate ID and health. They are not tests of Gmail delivery or payment collection. [Inspect CI runs](https://github.com/Axhitgg/invoice-payment-automation/actions). No recovery-rate improvement, money collected or percentage time saving has been measured.
+The isolated PostgreSQL runner creates its own synthetic-only local cluster with no TCP listener and never reads `DATABASE_URL`:
+
+```sh
+scripts/run_database_tests.sh
+```
+
+The current 12-test suite covers authentication, validation, atomic duplicate handling, dry-run behavior, concurrent schedule claims, repeated schedules, payment suppression, failed-send retry, terminal invoice states, summary reporting and the legacy-schema migration. GitHub Actions runs fast tests, PostgreSQL lifecycle tests and a Docker build. It does not send Gmail or collect a payment.
+
+The sanitised workflow under [`workflows/`](workflows/) was clean-imported and re-exported with n8n 2.44.5. The imported copy remained inactive, contained eight nodes, zero credential-bearing nodes and no pinned data. Importability is not evidence of a live Gmail execution.
 
 ## Limits and safe use
 
-This is a portfolio prototype, not an accounting or payment-processing system. It does not collect money, reconcile bank transactions or expose a payment-status update endpoint. Paid status must be maintained through a separate reviewed process. Repeated reminder queries can return the same invoices; add a delivery ledger, deduplication and retry policy before real email campaigns. Date logic uses the server timezone. Authentication uses a shared API key, and health does not check the database. Use fictional invoices and keep credentials outside Git.
+This is a portfolio prototype, not an accounting, collections or payment-processing system.
+
+- It does not reconcile bank transactions or verify that money arrived.
+- It queues work; n8n/email-provider delivery remains a separate integration.
+- If a worker disappears after claiming an event but before recording an outcome, the event can remain `queued`; a production system needs a lease/timeout and reconciliation job.
+- Provider timeout may be ambiguous: retrying could duplicate a message if the provider accepted it but the acknowledgement was lost.
+- One due-soon and one overdue reminder are allowed per invoice. A real cadence needs an approved contact policy and opt-out handling.
+- Status authentication uses a shared API key rather than user roles.
+- Date decisions use the server date.
+- Use fictional invoices only. Keep credentials outside Git and store only bounded failure codes, not message bodies or personal data.
+
+No recovery-rate improvement, money collected, user count or percentage time saving has been measured.
 
 ## Author
 
-[Akshit Singh](https://www.linkedin.com/in/akshit-singh-outlook/) - AI automation portfolio project.
+[Akshit Singh](https://www.linkedin.com/in/akshit-singh-outlook/) — AI automation portfolio project.
